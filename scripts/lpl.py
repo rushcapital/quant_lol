@@ -1,93 +1,196 @@
+from bs4 import BeautifulSoup
 import requests
-from selenium import webdriver
-import pyautogui
-from PIL import Image
-import time
-import cv2
-from io import BytesIO
-import numpy as np
+import re
+import pandas as pd
+import pickle
+import string
+import multiprocessing
 
-HEADERS = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_11_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/61.0.3163.100 Safari/537.36'}
+def query_league_match_history(league, headers):
 
-def find_LoL_subimage(subimage, webpage_ss):
+    response = requests.get(f'https://gol.gg/tournament/tournament-matchlist/{league}%20Summer%202022/', headers=headers).text
+    match_history = pd.read_html(response).pop()
+    return match_history
 
-    method = cv2.TM_SQDIFF_NORMED
+def get_team_ids(league, headers, base, mappings):
+    
+    mapping  = mappings[league]
+    response = requests.get(f'https://gol.gg/tournament/tournament-ranking/{league}%20Summer%202022/', headers=headers).text
+    soup     = BeautifulSoup(response, 'html.parser')
+    table    = soup.findAll('table')[0]
+    links    = table.findAll('a')
+    storage  = {mapping[link.text]:{'team_page':base + link.get('href').split('..')[-1]} for link in links}
+    
+    return storage
 
-    # Read the images from the file
-    small_image = cv2.imread(subimage)
-    large_image = cv2.imread(webpage_ss)
+def get_match_history(team_pages, headers, base, mappings):
 
-    result = cv2.matchTemplate(small_image, large_image, method)
+    for team, team_dict in team_pages.items(): 
+        first_no = re.compile(r'\d+')
+        first_no = first_no.search(team_dict['team_page']).group()
+        response = requests.get(f'https://gol.gg/teams/team-matchlist/{first_no}/split-Summer/tournament-ALL/', headers=headers).text
+        soup     = BeautifulSoup(response, 'html.parser')
+        table    = soup.findAll('table')[1]
+        rows     = table.findAll('tr')
+        
+        storage  = {}
 
-    # We want the minimum squared difference
-    mn,_,mnLoc,_ = cv2.minMaxLoc(result)
+        for row in rows[1:]:
+            cols    = row.findAll('td')
+            cols    = [ele.text.strip() for ele in cols]
+            
+            # get match result.
+            result  = cols[0]
 
-    # Draw the rectangle:
-    # Extract the coordinates of our best match
-    MPx,MPy = mnLoc
+            # get kills / patch / opponent
+            kills   = cols[3]
+            patch   = cols[-3]
+            opp     = cols[7]
 
-    return MPx, MPy
+            week    = cols[-2][-1]
+            
+            href    = [match.get('href') for match in row.findAll('a') if 'game' in match.get('href')][0]
+            href    = base + href.split('../')[-1]
 
-# we're going to have to sleep a decent bit because the js animations have to phase out of the image before we ss.
-driver = webdriver.Chrome(executable_path='../drivers/chromedriver.exe')
-width, height = 1024,1024
-adj_pix  = 105
-crop_tup = (0, height*0.3, width, height)
-driver.set_window_position(0,0)
-driver.set_window_size(width, height)
+            alph    = list(string.ascii_lowercase)
+            incr    = 0
+            while week in storage:
+                week = week + alph[incr]
+                incr += 1
+                
+            
+            storage[week] = {
+                'team'  : team,
+                'result': result,
+                'kills' : kills,
+                'patch' : patch,
+                'opp'   : opp,
+                'href'  : href
+            }
 
-# load webpage and handle the continue screen.
-driver.get('https://app.prizepicks.com/')
-time.sleep(1)
-pyautogui.moveTo(width*0.5, height*0.79)
-pyautogui.click()
+            incr = 0
+            
+        team_pages[team]['match_history'] = storage 
 
-time.sleep(1)
-# take screenshot of page, and then locate the LoL tab.
-driver.save_screenshot('../images/initial_webpage.png')
-x_LoL_i, y_LoL_i = find_LoL_subimage(subimage='../images/LoL.PNG', webpage_ss='../images/initial_webpage.png')
-print(x_LoL_i, y_LoL_i)
-# navigate to the LoL page.
-pyautogui.moveTo(x_LoL_i, y_LoL_i+adj_pix)
-time.sleep(10)
-pyautogui.click()
-time.sleep(1)
+    return team_pages
 
-# secure initial screenshot
-png = driver.get_screenshot_as_png()
-img = Image.open(BytesIO(png))
-img = img.crop(crop_tup)
-img.save('../images/initial_cropped.png')
-# screenshot = Image.open('../images/current_state.png')
+def gather_match_data(tup):
+	    
+    _dic = tup[1]
+    _dic['game'] = tup[0]
+    headers = tup[2]
 
-count = 0
-while True:
-    try:
-        time.sleep(10)
-        driver.refresh()
-        time.sleep(2)
-        driver.save_screenshot('../images/current_state.png')
-        x_LoL_c, y_LoL_c = find_LoL_subimage(subimage='../images/LoL.PNG', webpage_ss='../images/current_state.png')
-        pyautogui.moveTo(x_LoL_i, y_LoL_i+adj_pix)
-        time.sleep(1)
-        pyautogui.click()
-        ss = f'../images/current_LoL.png'
-        driver.save_screenshot(ss)
-        screenshot = Image.open(ss)
-        im = screenshot.crop(crop_tup)
-        im.save('../images/cropped.png')
+    attempts = 0
+    while True:
+        try:
+            response = requests.get(_dic['href'], headers=headers).text
+            # soup     = BeautifulSoup(response, 'html.parser')	
+            tables   = pd.read_html(response)
+            kdas     = [df.loc[:, ~df.columns.str.contains('^Unnamed')] for df in tables if 'Player' in df.columns]
+            gold_dmg = [df for df in tables if _dic['team'] in list(df.iloc[0])]
 
-        a = cv2.imread('../images/initial_cropped.png')
-        b = cv2.imread(f'../images/cropped.png')
+            gold = gold_dmg[0]
+            dmg  = gold_dmg[1]
 
-        diff = cv2.subtract(a,b)
-        res = not np.any(diff)
-        if res:
-            print("pictures are the same.")
-        else:
-            cv2.imwrite("../images/diff.png", diff )
-            print('differences stored in diff.png')
+            team_a = gold.iloc[0][1]
+            team_b = gold.iloc[0][2]
+            _idx   = None
 
-        count += 1
-    except KeyboardInterrupt:
-        driver.close()
+            if team_a == _dic['team']:
+                _idx = 0 
+            else:
+                _idx = 1
+
+            gold = gold[1:]
+            dmg  = dmg[1:]
+
+            players = {}
+            _team   = kdas[_idx]
+
+            for _, row in _team.iterrows():
+                players[row['Player']] = {
+                    'k': int(row['KDA'].split('/')[0]),
+                    'd': int(row['KDA'].split('/')[1]),
+                    'a': int(row['KDA'].split('/')[2])
+                }
+
+            keys = list(players.keys())
+            
+            for idx, row in gold.iterrows():	
+                players[keys[idx-1]]['gold'] = round(float(list(row)[_idx+1].replace("%",""))/100,3)
+
+            for idx, row in dmg.iterrows():
+                players[keys[idx-1]]['dmg'] = round(float(list(row)[_idx+1].replace("%",""))/100,3)
+
+            _dic['players'] = players           
+            
+            print('completed:', _dic['team'], tup[0])
+            break
+        
+        except Exception as err:
+            print(err)
+            print(_dic['team'],_dic['game'],':', _dic['href'],'. retrying. attempt:', attempts)
+            attempts += 1
+
+    return _dic
+
+
+if __name__ == '__main__':
+
+    mappings = {
+        'LPL':  {
+            'Victory Five'       : 'V5',
+            'Top Esports'        : 'TOP',
+            'JD Gaming'          : 'JDG',
+            'Royal Never Give Up': 'RNG',
+            'Edward Gaming'      : 'EDG',
+            'Weibo Gaming'       : 'WBG',
+            'OMG'                : 'OMG',
+            'LNG Esports'        : 'LNG',
+            'Anyone s Legend'    : 'AL',
+            'Bilibili Gaming'    : 'BLG',
+            'Funplus Phoenix'    : 'FPX',
+            'LGD Gaming'         : 'LGD',
+            'Rare Atom'          : 'RA',
+            'Ultra Prime'        : 'UP',
+            'Team WE'            : 'WE',
+            'TT'                 : 'TT',
+            'Invictus Gaming'    : 'IG'
+        },
+        'LCK':  {
+            'Gen.G eSports'      : 'GEN',
+            'T1'                 : 'T1',
+            'Liiv SANDBOX'       : 'LSB',
+            'DWG KIA'            : 'DWG',
+            'KT Rolster'         : 'KT',
+            'DRX'                : 'DRX',
+            'Kwangdong Freecs'   : 'KDF',
+            'Fredit BRION'       : 'BRO',
+            'Nongshim RedForce'  : 'NS',
+            'Hanwha Life eSports': 'HLE',
+        }
+    }
+
+    BASE_URL = 'https://gol.gg/'
+    HEADERS  = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_11_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/61.0.3163.100 Safari/537.36'}
+    
+    team_pages = get_team_ids('LPL', HEADERS, BASE_URL, mappings)
+    
+    t = get_match_history(team_pages, HEADERS, BASE_URL, mappings)
+    
+    with open('../datasets/match_history.pkl', 'wb') as handle:
+        pickle.dump(t, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+    with open('../datasets/match_history.pkl', 'rb') as handle:
+        pkl = pickle.load(handle)
+    
+    tups = []
+    for team, team_dict in pkl.items():
+        for k,v in team_dict['match_history'].items():
+            tups.append((k, v, HEADERS))
+
+    with multiprocessing.Pool(6) as pool:
+        results = pool.map(gather_match_data, tups)
+
+    with open('../datasets/lpl_stats.pkl', 'wb') as handle:
+        pickle.dump(t, handle, protocol=pickle.HIGHEST_PROTOCOL)
